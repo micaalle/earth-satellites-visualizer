@@ -11,6 +11,7 @@
 #include <cmath>
 #include <chrono>
 #include <ctime>
+#include <cstdio> 
 
 #include "Shader.h"
 #include "Camera.h"
@@ -19,6 +20,8 @@
 
 #include "TleLoader.h"
 #include "Sgp4System.h"
+
+#include "Conjunction.h"
 
 #include "imgui.h"
 #include "backends/imgui_impl_glfw.h"
@@ -31,6 +34,8 @@ static bool gMouseCaptured = true;
 
 static int gWinW = 1920;
 static int gWinH = 1080;
+
+static int gSSA_HitsForSat = -1;
 
 static bool gPaused = false;
 static float gTimeScale = 1.0f;
@@ -87,9 +92,7 @@ static void scroll_callback(GLFWwindow *, double, double yoff)
 static void processInput(GLFWwindow *w, float dt)
 {
     if (glfwGetKey(w, GLFW_KEY_ESCAPE) == GLFW_PRESS)
-    {
         glfwSetWindowShouldClose(w, true);
-    }
 
     static bool lastTab = false;
     bool tab = glfwGetKey(w, GLFW_KEY_TAB) == GLFW_PRESS;
@@ -152,11 +155,9 @@ static double julianDayUTC(const std::tm &utc, double fracSeconds)
     int B = 2 - A + (A / 4);
 
     double JD = std::floor(365.25 * (Y + 4716)) + std::floor(30.6001 * (M + 1)) + (double)D + (double)B - 1524.5 + hour / 24.0;
-
     return JD;
 }
 
-// sun direction for UTC adjust later idk hiow accurate this is!!!
 static glm::vec3 sunDirECI_FromUTC(const std::chrono::system_clock::time_point &tpUtc)
 {
     using namespace std::chrono;
@@ -251,7 +252,6 @@ static glm::vec3 rotateY(const glm::vec3 &v, float a)
     return glm::vec3(c * v.x + s * v.z, v.y, -s * v.x + c * v.z);
 }
 
-// Adjust this later!!!
 static float satBrightnessShadow(const glm::vec3 &p, const glm::vec3 &sunDir, float earthRadius)
 {
     float dp = glm::dot(p, sunDir);
@@ -281,6 +281,28 @@ struct SatVertex
     float bright;
 };
 
+static float gSSA_HorizonHrs = 2.0f;
+static float gSSA_StepSec = 20.0f;
+static float gSSA_ThresholdKm = 25.0f;
+static int gSSA_MaxSats = 12000;
+static bool gSSA_Refine = true;
+static std::vector<ConjunctionHit> gSSA_Hits;
+static int gSSA_SelectedHit = -1;
+static float gSSA_LastRunMs = 0.0f;
+
+static bool gSSA_ShowConjLine = true;
+static float gSSA_ConjAlpha = 0.85f;
+
+static void clearSSA(OrbitLine &conjLine, std::vector<glm::vec3> &conjPts)
+{
+    gSSA_Hits.clear();
+    gSSA_SelectedHit = -1;
+    gSSA_HitsForSat = -1;
+
+    conjPts.clear();
+    conjLine.update(conjPts);
+}
+
 int main()
 {
     if (!glfwInit())
@@ -294,7 +316,7 @@ int main()
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
     glfwWindowHint(GLFW_SRGB_CAPABLE, GLFW_TRUE);
 
-    GLFWwindow *window = glfwCreateWindow(gWinW, gWinH, "Earth + Satellites (Nadir line)", nullptr, nullptr);
+    GLFWwindow *window = glfwCreateWindow(gWinW, gWinH, "Earth + Satellites (SSA)", nullptr, nullptr);
     if (!window)
     {
         std::cerr << "Failed to create GLFW window\n";
@@ -344,15 +366,11 @@ int main()
     }
     float earthScale = hasEarthGltf ? (earthRadius / earthGltf.boundsRadius()) : 1.0f;
 
-    // i used celestrak.org for the data set, should just be active ones
-    // maybe ill add inactive later but idk how populated that would make it
     const std::string tlePath = "data/tles.txt";
     Sgp4System sgp4sys;
     bool loaded = sgp4sys.loadFromTleFile(tlePath);
     if (!loaded)
-    {
         std::cerr << "Failed to load TLE file: " << tlePath << "\n";
-    }
     size_t satCount = loaded ? sgp4sys.count() : 0;
 
     std::vector<glm::vec3> satPos(satCount);
@@ -376,7 +394,6 @@ int main()
     glVertexAttribPointer(1, 1, GL_FLOAT, GL_FALSE, sizeof(SatVertex), (void *)offsetof(SatVertex, bright));
     glBindVertexArray(0);
 
-    //highlighted satellite needs fixing idk if this works
     GLuint hiVAO = 0, hiVBO = 0;
     glGenVertexArrays(1, &hiVAO);
     glGenBuffers(1, &hiVBO);
@@ -393,7 +410,6 @@ int main()
     glVertexAttribPointer(1, 1, GL_FLOAT, GL_FALSE, sizeof(SatVertex), (void *)offsetof(SatVertex, bright));
     glBindVertexArray(0);
 
-    // fix orbit lines for satallites way out into space idk if its a data issue or the tle
     OrbitLine orbitLine;
     orbitLine.init();
     std::vector<glm::vec3> orbitPts;
@@ -402,14 +418,17 @@ int main()
     groundLine.init();
     std::vector<glm::vec3> groundPts;
 
-    // !!!!!!! prob make this the radius in which it can see later
     OrbitLine nadirLine;
     nadirLine.init();
     std::vector<glm::vec3> nadirPts;
     nadirPts.reserve(2);
 
-    float lastTime = (float)glfwGetTime();
+    OrbitLine conjLine;
+    conjLine.init();
+    std::vector<glm::vec3> conjPts;
+    conjPts.reserve(2);
 
+    float lastTime = (float)glfwGetTime();
     const auto startUtcTP = std::chrono::system_clock::now();
 
     bool useRealSun = true;
@@ -456,10 +475,17 @@ int main()
         if (pressed(window, GLFW_KEY_R))
             gSimTime = 0.0f;
 
-        if (pressed(window, GLFW_KEY_N) && satCount > 0)
-            gSelectedSat = (gSelectedSat + 1) % (int)satCount;
-        if (pressed(window, GLFW_KEY_P) && satCount > 0)
-            gSelectedSat = (gSelectedSat - 1 + (int)satCount) % (int)satCount;
+        if (satCount > 0)
+        {
+            int before = gSelectedSat;
+            if (pressed(window, GLFW_KEY_N))
+                gSelectedSat = (gSelectedSat + 1) % (int)satCount;
+            if (pressed(window, GLFW_KEY_P))
+                gSelectedSat = (gSelectedSat - 1 + (int)satCount) % (int)satCount;
+
+            if (gSelectedSat != before)
+                clearSSA(conjLine, conjPts);
+        }
 
         if (!gPaused)
             gSimTime += dt * gTimeScale;
@@ -475,15 +501,13 @@ int main()
 
         float theta = 0.0f;
         if (useRealSun && rotateEarthGMST)
-        {
             theta = (float)gmstRadians_FromUTC(simUtcTP) + glm::radians(earthLonOffsetDeg);
-        }
 
         glm::mat4 proj = glm::perspective(glm::radians(gCam.fov), (float)gWinW / (float)gWinH, 0.01f, 200.0f);
         glm::mat4 view = gCam.view();
         glm::mat4 VP = proj * view;
 
-        // sat update !
+        // sat update
         if (loaded && satCount > 0)
         {
             gSelectedSat = std::clamp(gSelectedSat, 0, (int)satCount - 1);
@@ -542,8 +566,12 @@ int main()
                         bestId = (int)i;
                     }
                 }
-                if (bestId >= 0)
+
+                if (bestId >= 0 && bestId != gSelectedSat)
+                {
                     gSelectedSat = bestId;
+                    clearSSA(conjLine, conjPts);
+                }
             }
 
             glm::vec3 selPos = satPos[(size_t)gSelectedSat];
@@ -571,7 +599,6 @@ int main()
             float sb = satBrightnessShadow(selPos, sunDir, earthRadius);
             selInShadow = (sb < 0.6f);
 
-            // orbit line
             orbitPts.clear();
             const int orbitSamples = 512;
             orbitPts.reserve(orbitSamples);
@@ -584,7 +611,7 @@ int main()
                 orbitPts.back() = orbitPts.front();
             orbitLine.update(orbitPts);
 
-            // ground track
+            // ground track adjust later i dont really like this maybe disable it on start:/
             if (showGroundTrack)
             {
                 groundPts.clear();
@@ -605,9 +632,7 @@ int main()
 
                     float th = 0.0f;
                     if (useRealSun && rotateEarthGMST)
-                    {
                         th = (float)gmstRadians_FromUTC(tp) + glm::radians(earthLonOffsetDeg);
-                    }
 
                     glm::vec3 pEci = sgp4sys.sample((size_t)gSelectedSat, t, earthRadius);
                     glm::vec3 pEcef = rotateY(pEci, -th);
@@ -623,7 +648,6 @@ int main()
                 groundLine.update(groundPts);
             }
 
-            // nadir line
             if (showNadirLine)
             {
                 glm::vec3 surf = glm::normalize(selPos) * (earthRadius * 1.002f);
@@ -634,7 +658,6 @@ int main()
             }
         }
 
-        // Imgui stuff rm some of it because i dont think the dot size and the highlight fr naidar work
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
@@ -654,7 +677,13 @@ int main()
         ImGui::Text("Loaded: %s | sats: %d", loaded ? "yes" : "no", (int)satCount);
 
         ImGui::Separator();
-        ImGui::SliderInt("Selected", &gSelectedSat, 0, (satCount > 0) ? ((int)satCount - 1) : 0);
+        {
+            int before = gSelectedSat;
+            ImGui::SliderInt("Selected", &gSelectedSat, 0, (satCount > 0) ? ((int)satCount - 1) : 0);
+            if (gSelectedSat != before)
+                clearSSA(conjLine, conjPts);
+        }
+
         if (loaded && satCount > 0)
         {
             ImGui::Text("Name: %s", sgp4sys.name((size_t)gSelectedSat).c_str());
@@ -690,22 +719,139 @@ int main()
         ImGui::SliderFloat("Highlight size", &highlightPointSize, 6.0f, 40.0f, "%.1f");
 
         ImGui::Separator();
+        if (ImGui::CollapsingHeader("SSA - Conjunctions (Selected vs All)", ImGuiTreeNodeFlags_DefaultOpen))
+        {
+            ImGui::SliderFloat("Horizon (hours)", &gSSA_HorizonHrs, 0.25f, 24.0f, "%.2f");
+            ImGui::SliderFloat("Step (sec)", &gSSA_StepSec, 1.0f, 120.0f, "%.0f");
+            ImGui::SliderFloat("Threshold (km)", &gSSA_ThresholdKm, 1.0f, 200.0f, "%.1f");
+            ImGui::Checkbox("Refine TCA", &gSSA_Refine);
+
+            int maxMax = (satCount > 0) ? (int)satCount : 1;
+            gSSA_MaxSats = std::clamp(gSSA_MaxSats, 1, maxMax);
+            ImGui::SliderInt("Max sats to check", &gSSA_MaxSats, 1, maxMax);
+
+            ImGui::Checkbox("Show conjunction line", &gSSA_ShowConjLine);
+            ImGui::SliderFloat("Conj line alpha", &gSSA_ConjAlpha, 0.05f, 1.0f, "%.2f");
+
+            if (ImGui::Button("Run conjunction screening"))
+            {
+                if (loaded && satCount > 0)
+                {
+                    ConjunctionParams p;
+                    p.horizonSec = (double)gSSA_HorizonHrs * 3600.0;
+                    p.stepSec = (double)gSSA_StepSec;
+                    p.thresholdKm = (double)gSSA_ThresholdKm;
+                    p.maxSatsToCheck = gSSA_MaxSats;
+                    p.refine = gSSA_Refine;
+
+                    auto t0 = std::chrono::high_resolution_clock::now();
+                    bool ok = computeConjunctionsSelectedVsAll(
+                        sgp4sys,
+                        (size_t)gSelectedSat,
+                        (double)gSimTime,
+                        p,
+                        gSSA_Hits);
+                    auto t1 = std::chrono::high_resolution_clock::now();
+                    gSSA_LastRunMs = (float)std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+                    if (!ok || gSSA_Hits.empty())
+                    {
+                        gSSA_SelectedHit = -1;
+                        gSSA_HitsForSat = -1;
+                        conjPts.clear();
+                        conjLine.update(conjPts);
+                    }
+                    else
+                    {
+                        gSSA_SelectedHit = 0;
+                        gSSA_HitsForSat = gSelectedSat; 
+                    }
+                }
+            }
+
+            ImGui::SameLine();
+            ImGui::Text("Last run: %.1f ms | hits: %d", gSSA_LastRunMs, (int)gSSA_Hits.size());
+
+            if (!gSSA_Hits.empty())
+            {
+                ImGui::BeginChild("##hits", ImVec2(0, 160), true);
+
+                const int showMax = std::min(200, (int)gSSA_Hits.size());
+                for (int i = 0; i < showMax; ++i)
+                {
+                    const auto &h = gSSA_Hits[i];
+
+                    const char *otherName =
+                        (h.otherIdx >= 0 && (size_t)h.otherIdx < satCount)
+                            ? sgp4sys.name((size_t)h.otherIdx).c_str()
+                            : "?";
+
+                    char label[256];
+                    std::snprintf(label, sizeof(label),
+                                  "%3d) miss %.2f km | TCA +%.1f min | rel %.2f km/s | %s",
+                                  i,
+                                  h.missKm,
+                                  (h.tcaSec - (double)gSimTime) / 60.0,
+                                  h.relSpeedKmS,
+                                  otherName);
+
+                    if (ImGui::Selectable(label, gSSA_SelectedHit == i))
+                        gSSA_SelectedHit = i;
+                }
+
+                ImGui::EndChild();
+
+                if (gSSA_SelectedHit >= 0 && gSSA_SelectedHit < (int)gSSA_Hits.size())
+                {
+                    const auto &h = gSSA_Hits[gSSA_SelectedHit];
+
+                    if (ImGui::Button("Jump to TCA"))
+                    {
+                        gSimTime = (float)h.tcaSec;
+                    }
+                }
+            }
+        }
+
+        ImGui::Separator();
         ImGui::Text("TAB mouse capture | N/P cycle | SPACE pause");
         ImGui::Text("FPS: %.1f", ImGui::GetIO().Framerate);
         ImGui::End();
 
+        if (gSSA_ShowConjLine &&
+            loaded && satCount > 0 &&
+            gSSA_HitsForSat == gSelectedSat &&
+            gSSA_SelectedHit >= 0 && gSSA_SelectedHit < (int)gSSA_Hits.size())
+        {
+            const auto &h = gSSA_Hits[gSSA_SelectedHit];
+            if (h.otherIdx >= 0 && (size_t)h.otherIdx < satCount)
+            {
+                glm::vec3 a = sgp4sys.sample((size_t)gSelectedSat, (float)h.tcaSec, earthRadius);
+                glm::vec3 b = sgp4sys.sample((size_t)h.otherIdx, (float)h.tcaSec, earthRadius);
+
+                conjPts.clear();
+                conjPts.push_back(a);
+                conjPts.push_back(b);
+                conjLine.update(conjPts);
+            }
+            else
+            {
+                conjPts.clear();
+                conjLine.update(conjPts);
+            }
+        }
+        else
+        {
+            conjPts.clear();
+            conjLine.update(conjPts);
+        }
 
         glClearColor(0.005f, 0.007f, 0.015f, 1.0f);
-
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
-        // earth model pulled from nasa database
-        // maybe add some kinda lighting for the night like cities but idk how 
         glm::mat4 model = glm::mat4(1.0f);
         if (useRealSun && rotateEarthGMST)
-        {
             model = glm::rotate(glm::mat4(1.0f), theta, glm::vec3(0, 1, 0));
-        }
         model = model * glm::scale(glm::mat4(1.0f), glm::vec3(earthScale));
 
         if (hasEarthGltf)
@@ -719,7 +865,6 @@ int main()
             earthGltf.drawEarthStyle(earthSh, 0);
         }
 
-        // Lines
         glDepthMask(GL_FALSE);
         glLineWidth(2.0f);
 
@@ -727,7 +872,6 @@ int main()
         orbitSh.setMat4("uView", view);
         orbitSh.setMat4("uProj", proj);
 
-        // Orbit line
         glDepthFunc(GL_LESS);
         orbitSh.setFloat("uAlpha", 0.75f);
         orbitLine.draw();
@@ -760,6 +904,15 @@ int main()
             orbitSh.setFloat("uAlpha", nadirAlpha);
             nadirLine.draw();
         }
+
+        // ssa conjuction line adjust this is tmp for now
+        if (gSSA_ShowConjLine && !conjPts.empty() && gSSA_HitsForSat == gSelectedSat)
+        {
+            glDepthFunc(GL_LESS);
+            orbitSh.setFloat("uAlpha", gSSA_ConjAlpha);
+            conjLine.draw();
+        }
+
         glDepthFunc(GL_LESS);
 
         if (loaded && satCount > 0)
@@ -786,7 +939,6 @@ int main()
 
         glDepthMask(GL_TRUE);
 
-
         ImGui::Render();
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
@@ -810,3 +962,4 @@ int main()
     glfwTerminate();
     return 0;
 }
+
