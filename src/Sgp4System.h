@@ -3,7 +3,6 @@
 #include <string>
 #include <glm/glm.hpp>
 
-
 #include "Tle.h"
 #include "SGP4.h"
 
@@ -17,8 +16,9 @@ public:
     void positionsAt(float simTimeSec, float earthRadiusRender, std::vector<glm::vec3>& outPos) const;
     glm::vec3 sample(size_t idx, float simTimeSec, float earthRadiusRender) const;
 
-    double periodSeconds(size_t idx) const;
+    bool sampleKm(size_t idx, double simTimeSec, glm::dvec3& outPosKm) const;
 
+    double periodSeconds(size_t idx) const;
 
 private:
     std::vector<std::string> m_names;
