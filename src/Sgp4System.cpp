@@ -3,12 +3,16 @@
 
 #include <algorithm>
 #include <chrono>
+#include <iostream>    
+#include <exception>     
 
 #include "Eci.h"
 #include "DateTime.h"
 #include "Vector.h"
+#include "DecayedException.h"     
+#include "SatelliteException.h"   
 
-static constexpr double EARTH_RADIUS_KM = 6378.137; 
+static constexpr double EARTH_RADIUS_KM = 6378.137;
 
 static libsgp4::DateTime nowUtcDateTime()
 {
@@ -60,17 +64,45 @@ glm::vec3 Sgp4System::sample(size_t idx, float simTimeSec, float earthRadiusRend
     if (idx >= m_sats.size()) return glm::vec3(0);
 
     static libsgp4::DateTime startUtc = nowUtcDateTime();
-    libsgp4::DateTime t = startUtc.AddSeconds((double)simTimeSec);
 
-    libsgp4::Eci eci = m_sats[idx].sgp4.FindPosition(t);
-    libsgp4::Vector posKm = eci.Position(); // km
+    try {
+        libsgp4::DateTime t = startUtc.AddSeconds((double)simTimeSec);
 
-    const float scale = earthRadiusRender / (float)EARTH_RADIUS_KM;
-    return glm::vec3(
-        (float)posKm.x * scale,
-        (float)posKm.y * scale,
-        (float)posKm.z * scale
-    );
+        libsgp4::Eci eci = m_sats[idx].sgp4.FindPosition(t);
+        libsgp4::Vector posKm = eci.Position();
+
+        const float scale = earthRadiusRender / (float)EARTH_RADIUS_KM;
+        return glm::vec3(
+            (float)posKm.x * scale,
+            (float)posKm.y * scale,
+            (float)posKm.z * scale
+        );
+    }
+    catch (const libsgp4::DecayedException&) {
+    }
+    catch (const libsgp4::SatelliteException&) {
+    }
+    catch (const std::exception& e) {
+
+        static int printed = 0;
+        if (printed < 10) {
+            std::cerr << "[SGP4] exception idx=" << idx
+                      << " name=" << (idx < m_names.size() ? m_names[idx] : std::string("?"))
+                      << " simTimeSec=" << simTimeSec
+                      << " what=" << e.what() << "\n";
+            printed++;
+        }
+    }
+    catch (...) {
+        static int printed = 0;
+        if (printed < 10) {
+            std::cerr << "[SGP4] unknown exception idx=" << idx
+                      << " simTimeSec=" << simTimeSec << "\n";
+            printed++;
+        }
+    }
+
+    return glm::vec3(0);
 }
 
 void Sgp4System::positionsAt(float simTimeSec, float earthRadiusRender, std::vector<glm::vec3>& outPos) const
@@ -84,6 +116,7 @@ void Sgp4System::positionsAt(float simTimeSec, float earthRadiusRender, std::vec
 double Sgp4System::periodSeconds(size_t idx) const
 {
     if (idx >= m_sats.size()) return 0.0;
-    double mm = m_sats[idx].tle.MeanMotion(); // rev/day
+    double mm = m_sats[idx].tle.MeanMotion();
     return (mm > 1e-9) ? (86400.0 / mm) : 0.0;
 }
+
