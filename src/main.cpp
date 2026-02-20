@@ -11,7 +11,7 @@
 #include <cmath>
 #include <chrono>
 #include <ctime>
-#include <cstdio> 
+#include <cstdio>
 
 #include "Shader.h"
 #include "Camera.h"
@@ -26,6 +26,10 @@
 #include "imgui.h"
 #include "backends/imgui_impl_glfw.h"
 #include "backends/imgui_impl_opengl3.h"
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 
 static Camera gCam;
 static bool gFirstMouse = true;
@@ -135,8 +139,16 @@ static std::string pathJoin(const std::string &a, const std::string &b)
     return a + "/" + b;
 }
 
-static double deg2rad(double d) { return d * 3.14159265358979323846 / 180.0; }
-static double rad2deg(double r) { return r * 180.0 / 3.14159265358979323846; }
+static double deg2rad(double d) { return d * M_PI / 180.0; }
+static double rad2deg(double r) { return r * 180.0 / M_PI; }
+
+static double wrapDeg(double x)
+{
+    x = std::fmod(x, 360.0);
+    if (x < 0)
+        x += 360.0;
+    return x;
+}
 
 static double julianDayUTC(const std::tm &utc, double fracSeconds)
 {
@@ -158,7 +170,7 @@ static double julianDayUTC(const std::tm &utc, double fracSeconds)
     return JD;
 }
 
-static glm::vec3 sunDirECI_FromUTC(const std::chrono::system_clock::time_point &tpUtc)
+static double julianDay_FromTimePointUTC(const std::chrono::system_clock::time_point &tpUtc)
 {
     using namespace std::chrono;
     const auto tt = system_clock::to_time_t(tpUtc);
@@ -172,8 +184,12 @@ static glm::vec3 sunDirECI_FromUTC(const std::chrono::system_clock::time_point &
 
     const auto base = system_clock::from_time_t(tt);
     const double frac = duration<double>(tpUtc - base).count();
+    return julianDayUTC(utc, frac);
+}
 
-    const double JD = julianDayUTC(utc, frac);
+static glm::vec3 sunDirECI_FromUTC(const std::chrono::system_clock::time_point &tpUtc)
+{
+    const double JD = julianDay_FromTimePointUTC(tpUtc);
     const double T = (JD - 2451545.0) / 36525.0;
 
     double L0 = std::fmod(280.46646 + T * (36000.76983 + 0.0003032 * T), 360.0);
@@ -211,25 +227,13 @@ static glm::vec3 sunDirECI_FromUTC(const std::chrono::system_clock::time_point &
     s.y = std::cos(delta) * std::sin(alpha);
     s.z = std::sin(delta);
 
-    return glm::normalize(glm::vec3((float)s.x, (float)s.y, (float)s.z));
+    glm::vec3 w((float)s.x, (float)s.z, (float)s.y);
+    return glm::normalize(w);
 }
 
 static double gmstRadians_FromUTC(const std::chrono::system_clock::time_point &tpUtc)
 {
-    using namespace std::chrono;
-    const auto tt = system_clock::to_time_t(tpUtc);
-
-    std::tm utc{};
-#if defined(_WIN32)
-    gmtime_s(&utc, &tt);
-#else
-    gmtime_r(&tt, &utc);
-#endif
-
-    const auto base = system_clock::from_time_t(tt);
-    const double frac = duration<double>(tpUtc - base).count();
-
-    const double JD = julianDayUTC(utc, frac);
+    const double JD = julianDay_FromTimePointUTC(tpUtc);
     const double T = (JD - 2451545.0) / 36525.0;
 
     double gmstDeg =
@@ -281,6 +285,75 @@ struct SatVertex
     float bright;
 };
 
+// fix later for closer accurate but prob close enough for now
+static glm::vec3 moonPosECI_FromUTC(const std::chrono::system_clock::time_point &tpUtc,
+                                    float earthRadius,
+                                    float EARTH_RADIUS_KM)
+{
+    const double JD = julianDay_FromTimePointUTC(tpUtc);
+    const double d = JD - 2451545.0;
+    const double T = d / 36525.0;
+
+    double L0 = wrapDeg(218.3164477 + 13.17639648 * d);
+    double Mm = wrapDeg(134.9633964 + 13.06499295 * d);
+    double Ms = wrapDeg(357.5291092 + 0.98560028 * d);
+    double D = wrapDeg(297.8501921 + 12.19074912 * d);
+    double F = wrapDeg(93.2720950 + 13.22935024 * d);
+
+    double L0r = deg2rad(L0);
+    double Mmr = deg2rad(Mm);
+    double Msr = deg2rad(Ms);
+    double Dr = deg2rad(D);
+    double Fr = deg2rad(F);
+
+    double lon =
+        L0 +
+        6.289 * std::sin(Mmr) +
+        1.274 * std::sin(2.0 * Dr - Mmr) +
+        0.658 * std::sin(2.0 * Dr) +
+        0.214 * std::sin(2.0 * Mmr) +
+        0.110 * std::sin(Dr);
+
+    double lat =
+        5.128 * std::sin(Fr) +
+        0.280 * std::sin(Mmr + Fr) +
+        0.277 * std::sin(Mmr - Fr) +
+        0.173 * std::sin(2.0 * Dr - Fr) +
+        0.055 * std::sin(2.0 * Dr + Fr - Mmr) +
+        0.046 * std::sin(2.0 * Dr - Fr - Mmr) +
+        0.033 * std::sin(2.0 * Dr + Fr) +
+        0.017 * std::sin(2.0 * Mmr + Fr);
+
+    double distKm =
+        385001.0 - 20905.0 * std::cos(Mmr) - 3699.0 * std::cos(2.0 * Dr - Mmr) - 2956.0 * std::cos(2.0 * Dr) - 570.0 * std::cos(2.0 * Mmr) + 246.0 * std::cos(2.0 * Mmr - 2.0 * Dr) - 205.0 * std::cos(Msr - 2.0 * Dr) - 171.0 * std::cos(Mmr + 2.0 * Dr) - 152.0 * std::cos(Mmr + Msr) - 129.0 * std::cos(Mmr - Msr) + 108.0 * std::cos(Dr);
+
+    double lonr = deg2rad(wrapDeg(lon));
+    double latr = deg2rad(lat);
+
+    double eps =
+        23.0 + (26.0 + (21.448 - T * (46.815 + T * (0.00059 - T * 0.001813))) / 60.0) / 60.0;
+    double epsr = deg2rad(eps);
+
+    double cl = std::cos(latr);
+    double x_ecl = distKm * cl * std::cos(lonr);
+    double y_ecl = distKm * cl * std::sin(lonr);
+    double z_ecl = distKm * std::sin(latr);
+
+    double x_eq = x_ecl;
+    double y_eq = y_ecl * std::cos(epsr) - z_ecl * std::sin(epsr);
+    double z_eq = y_ecl * std::sin(epsr) + z_ecl * std::cos(epsr);
+
+    glm::dvec3 w;
+    w.x = x_eq;
+    w.y = z_eq;
+    w.z = y_eq;
+
+    glm::vec3 pos = glm::vec3((float)(w.x / EARTH_RADIUS_KM),
+                              (float)(w.y / EARTH_RADIUS_KM),
+                              (float)(w.z / EARTH_RADIUS_KM));
+    return pos * earthRadius;
+}
+
 static float gSSA_HorizonHrs = 2.0f;
 static float gSSA_StepSec = 20.0f;
 static float gSSA_ThresholdKm = 25.0f;
@@ -316,7 +389,7 @@ int main()
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
     glfwWindowHint(GLFW_SRGB_CAPABLE, GLFW_TRUE);
 
-    GLFWwindow *window = glfwCreateWindow(gWinW, gWinH, "Earth + Satellites (SSA)", nullptr, nullptr);
+    GLFWwindow *window = glfwCreateWindow(gWinW, gWinH, "Earth + Satellites + Moon/Sun (SSA)", nullptr, nullptr);
     if (!window)
     {
         std::cerr << "Failed to create GLFW window\n";
@@ -355,16 +428,39 @@ int main()
     Shader satSh(pathJoin(shaderDir, "sats.vert"), pathJoin(shaderDir, "sats.frag"));
     Shader orbitSh(pathJoin(shaderDir, "orbit.vert"), pathJoin(shaderDir, "orbit.frag"));
 
+    // looks yellow now make it better later
+    Shader sunSh(pathJoin(shaderDir, "sun.vert"), pathJoin(shaderDir, "sun.frag"));
+
     const float earthRadius = 1.0f;
     const float EARTH_RADIUS_KM = 6378.137f;
 
     GltfModel earthGltf;
     bool hasEarthGltf = earthGltf.loadFromFile(pathJoin(assetDir, "Earth_1_12756.glb"), true);
     if (!hasEarthGltf)
-    {
         std::cerr << "Failed to load GLB: " << pathJoin(assetDir, "Earth_1_12756.glb") << "\n";
-    }
     float earthScale = hasEarthGltf ? (earthRadius / earthGltf.boundsRadius()) : 1.0f;
+
+    const float MOON_RADIUS_EARTH = 1737.4f / EARTH_RADIUS_KM;
+
+    GltfModel moonGltf;
+    bool hasMoon = moonGltf.loadFromFile(pathJoin(assetDir, "Moon.glb"), true);
+    if (!hasMoon)
+        std::cerr << "Failed to load Moon.glb (assets/Moon.glb)\n";
+    float moonScale = hasMoon ? (MOON_RADIUS_EARTH / moonGltf.boundsRadius()) : 1.0f;
+
+    GltfModel sunGltf;
+    bool hasSun = false;
+
+    hasSun = sunGltf.loadFromFile(pathJoin(assetDir, "Sun.glb"), true);
+
+    bool showMoon = true;
+    bool showMoonOrbit = false;
+    float moonOrbitAlpha = 0.65f;
+
+    bool showSunMesh = true;
+    float sunVisualDist = 120.0f; 
+    float sunVisualRadius = 6.0f; 
+    float sunScale = (hasSun && sunGltf.boundsRadius() > 1e-6f) ? (sunVisualRadius / sunGltf.boundsRadius()) : 1.0f;
 
     const std::string tlePath = "data/tles.txt";
     Sgp4System sgp4sys;
@@ -428,6 +524,10 @@ int main()
     std::vector<glm::vec3> conjPts;
     conjPts.reserve(2);
 
+    OrbitLine moonOrbitLine;
+    moonOrbitLine.init();
+    std::vector<glm::vec3> moonOrbitPts;
+
     float lastTime = (float)glfwGetTime();
     const auto startUtcTP = std::chrono::system_clock::now();
 
@@ -482,7 +582,6 @@ int main()
                 gSelectedSat = (gSelectedSat + 1) % (int)satCount;
             if (pressed(window, GLFW_KEY_P))
                 gSelectedSat = (gSelectedSat - 1 + (int)satCount) % (int)satCount;
-
             if (gSelectedSat != before)
                 clearSSA(conjLine, conjPts);
         }
@@ -507,6 +606,36 @@ int main()
         glm::mat4 view = gCam.view();
         glm::mat4 VP = proj * view;
 
+        glm::vec3 moonPos = moonPosECI_FromUTC(simUtcTP, earthRadius, EARTH_RADIUS_KM);
+
+        if (showMoonOrbit)
+        {
+            moonOrbitPts.clear();
+            const int N = 512;
+            moonOrbitPts.reserve(N);
+            const double spanSec = 28.0 * 86400.0;
+
+            for (int i = 0; i < N; ++i)
+            {
+                double u = (double)i / (double)(N - 1);
+                double offsetSec = (u - 0.5) * spanSec;
+
+                auto tp =
+                    simUtcTP +
+                    std::chrono::duration_cast<std::chrono::system_clock::duration>(
+                        std::chrono::duration<double>(offsetSec));
+
+                moonOrbitPts.push_back(moonPosECI_FromUTC(tp, earthRadius, EARTH_RADIUS_KM));
+            }
+            if (!moonOrbitPts.empty())
+                moonOrbitPts.back() = moonOrbitPts.front();
+            moonOrbitLine.update(moonOrbitPts);
+        }
+        else
+        {
+            moonOrbitPts.clear();
+            moonOrbitLine.update(moonOrbitPts);
+        }
         // sat update
         if (loaded && satCount > 0)
         {
@@ -610,7 +739,7 @@ int main()
             if (!orbitPts.empty())
                 orbitPts.back() = orbitPts.front();
             orbitLine.update(orbitPts);
-
+            
             // ground track adjust later i dont really like this maybe disable it on start:/
             if (showGroundTrack)
             {
@@ -658,6 +787,7 @@ int main()
             }
         }
 
+        // ImGui
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
@@ -719,6 +849,22 @@ int main()
         ImGui::SliderFloat("Highlight size", &highlightPointSize, 6.0f, 40.0f, "%.1f");
 
         ImGui::Separator();
+        if (ImGui::CollapsingHeader("Moon / Sun", ImGuiTreeNodeFlags_DefaultOpen))
+        {
+            ImGui::Checkbox("Show Moon", &showMoon);
+            ImGui::Checkbox("Show Moon orbit line", &showMoonOrbit);
+            ImGui::SliderFloat("Moon orbit alpha", &moonOrbitAlpha, 0.05f, 1.0f, "%.2f");
+
+            ImGui::Separator();
+            ImGui::Checkbox("Show Sun mesh", &showSunMesh);
+            ImGui::SliderFloat("Sun visual distance", &sunVisualDist, 20.0f, 190.0f, "%.1f");
+            ImGui::SliderFloat("Sun visual radius", &sunVisualRadius, 1.0f, 20.0f, "%.1f");
+
+            if (hasSun && sunGltf.boundsRadius() > 1e-6f)
+                sunScale = (sunVisualRadius / sunGltf.boundsRadius());
+        }
+
+        ImGui::Separator();
         if (ImGui::CollapsingHeader("SSA - Conjunctions (Selected vs All)", ImGuiTreeNodeFlags_DefaultOpen))
         {
             ImGui::SliderFloat("Horizon (hours)", &gSSA_HorizonHrs, 0.25f, 24.0f, "%.2f");
@@ -764,53 +910,13 @@ int main()
                     else
                     {
                         gSSA_SelectedHit = 0;
-                        gSSA_HitsForSat = gSelectedSat; 
+                        gSSA_HitsForSat = gSelectedSat;
                     }
                 }
             }
 
             ImGui::SameLine();
             ImGui::Text("Last run: %.1f ms | hits: %d", gSSA_LastRunMs, (int)gSSA_Hits.size());
-
-            if (!gSSA_Hits.empty())
-            {
-                ImGui::BeginChild("##hits", ImVec2(0, 160), true);
-
-                const int showMax = std::min(200, (int)gSSA_Hits.size());
-                for (int i = 0; i < showMax; ++i)
-                {
-                    const auto &h = gSSA_Hits[i];
-
-                    const char *otherName =
-                        (h.otherIdx >= 0 && (size_t)h.otherIdx < satCount)
-                            ? sgp4sys.name((size_t)h.otherIdx).c_str()
-                            : "?";
-
-                    char label[256];
-                    std::snprintf(label, sizeof(label),
-                                  "%3d) miss %.2f km | TCA +%.1f min | rel %.2f km/s | %s",
-                                  i,
-                                  h.missKm,
-                                  (h.tcaSec - (double)gSimTime) / 60.0,
-                                  h.relSpeedKmS,
-                                  otherName);
-
-                    if (ImGui::Selectable(label, gSSA_SelectedHit == i))
-                        gSSA_SelectedHit = i;
-                }
-
-                ImGui::EndChild();
-
-                if (gSSA_SelectedHit >= 0 && gSSA_SelectedHit < (int)gSSA_Hits.size())
-                {
-                    const auto &h = gSSA_Hits[gSSA_SelectedHit];
-
-                    if (ImGui::Button("Jump to TCA"))
-                    {
-                        gSimTime = (float)h.tcaSec;
-                    }
-                }
-            }
         }
 
         ImGui::Separator();
@@ -818,6 +924,7 @@ int main()
         ImGui::Text("FPS: %.1f", ImGui::GetIO().Framerate);
         ImGui::End();
 
+        // ssa conjuction line adjust this is tmp for now
         if (gSSA_ShowConjLine &&
             loaded && satCount > 0 &&
             gSSA_HitsForSat == gSelectedSat &&
@@ -849,20 +956,64 @@ int main()
         glClearColor(0.005f, 0.007f, 0.015f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
-        glm::mat4 model = glm::mat4(1.0f);
+        glm::mat4 earthM = glm::mat4(1.0f);
         if (useRealSun && rotateEarthGMST)
-            model = glm::rotate(glm::mat4(1.0f), theta, glm::vec3(0, 1, 0));
-        model = model * glm::scale(glm::mat4(1.0f), glm::vec3(earthScale));
+            earthM = glm::rotate(glm::mat4(1.0f), theta, glm::vec3(0, 1, 0));
+        earthM = earthM * glm::scale(glm::mat4(1.0f), glm::vec3(earthScale));
 
         if (hasEarthGltf)
         {
             earthSh.use();
-            earthSh.setMat4("uModel", model);
+            earthSh.setMat4("uModel", earthM);
             earthSh.setMat4("uView", view);
             earthSh.setMat4("uProj", proj);
             earthSh.setVec3("uSunDir", sunDir);
             earthSh.setVec3("uCamPos", gCam.pos);
             earthGltf.drawEarthStyle(earthSh, 0);
+        }
+
+        if (showMoon && hasMoon)
+        {
+            glm::mat4 moonM(1.0f);
+            moonM = glm::translate(moonM, moonPos);
+            moonM = glm::scale(moonM, glm::vec3(moonScale));
+
+            earthSh.use();
+            earthSh.setMat4("uModel", moonM);
+            earthSh.setMat4("uView", view);
+            earthSh.setMat4("uProj", proj);
+            earthSh.setVec3("uSunDir", sunDir);
+            earthSh.setVec3("uCamPos", gCam.pos);
+            moonGltf.drawEarthStyle(earthSh, 0);
+        }
+
+        if (showSunMesh && hasSun)
+        {
+            glm::vec3 sunPos = sunDir * sunVisualDist;
+
+            glm::mat4 sunM(1.0f);
+            sunM = glm::translate(sunM, sunPos);
+            sunM = glm::scale(sunM, glm::vec3(sunScale));
+
+            glDepthMask(GL_FALSE); 
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_ONE, GL_ONE); 
+
+            sunSh.use();
+            sunSh.setMat4("uModel", sunM);
+            sunSh.setMat4("uView", view);
+            sunSh.setMat4("uProj", proj);
+            sunSh.setVec3("uCamPos", gCam.pos);
+            sunSh.setFloat("uTime", gSimTime);
+
+            // adjust bc it yellow later
+            sunSh.setVec3("uBaseColor", glm::vec3(1.0f, 0.65f, 0.20f));
+            sunSh.setFloat("uIntensity", 2.6f);
+
+            sunGltf.drawEarthStyle(sunSh, 0);
+
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            glDepthMask(GL_TRUE);
         }
 
         glDepthMask(GL_FALSE);
@@ -905,7 +1056,13 @@ int main()
             nadirLine.draw();
         }
 
-        // ssa conjuction line adjust this is tmp for now
+        if (showMoonOrbit && !moonOrbitPts.empty())
+        {
+            glDepthFunc(GL_LESS);
+            orbitSh.setFloat("uAlpha", moonOrbitAlpha);
+            moonOrbitLine.draw();
+        }
+
         if (gSSA_ShowConjLine && !conjPts.empty() && gSSA_HitsForSat == gSelectedSat)
         {
             glDepthFunc(GL_LESS);
@@ -947,6 +1104,8 @@ int main()
     }
 
     earthGltf.destroy();
+    moonGltf.destroy();
+    sunGltf.destroy();
 
     glDeleteBuffers(1, &satVBO);
     glDeleteVertexArrays(1, &satVAO);
