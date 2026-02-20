@@ -1,5 +1,5 @@
 Assets found at
 
-sun : https://science.nasa.gov/learn/heat/resource/sun-3d-model/
+Sun : https://science.nasa.gov/learn/heat/resource/sun-3d-model/
 
 Earth : https://science.nasa.gov/resource/earth-3d-model/
